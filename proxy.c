@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
+#include <netdb.h>
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
@@ -67,10 +68,34 @@ char* validate_proxy_request(char *buf) {
     return filepath;    
 }
 
+
+char* construct_cache_path(char* hostname, char* port, char* path) {
+    char *cache_dir = "./cache";
+    char *host_port = malloc(strlen(hostname) + strlen(port) + 2);
+    sprintf(host_port, "%s_%s", hostname, port);
+    
+    char *cache_path;
+    
+    // Check if . in string, if not, we assume index.html
+    if (strchr(path, '.') == NULL) {
+        if (strcmp(path, "/") == 0) {
+            cache_path = malloc(strlen(cache_dir) + 1 + strlen(host_port) + strlen("index.html") + 1);
+            sprintf(cache_path, "%s/%s/index.html", cache_dir, host_port);
+        } else {
+            cache_path = malloc(strlen(cache_dir) + 1 + strlen(host_port) + strlen(path) + strlen("/index.html") + 1);
+            sprintf(cache_path, "%s/%s%s/index.html", cache_dir, host_port, path);
+        }
+    } else {
+        cache_path = malloc(strlen(cache_dir) + 1 + strlen(host_port) + strlen(path) + 1);
+        sprintf(cache_path, "%s/%s%s", cache_dir, host_port, path);
+    }
+
+    free(host_port);
+    return cache_path;
+}
+
 int parse_url(char *filepath, char **hostname, char **port, char **path, int *has_query) {
     char *url = filepath;
-
-    printf("url: %s\n", url);
 
     // Must be http
     if (strncmp(url, "http://", 7) != 0) { printf("PARSE ERR: Not http\n"); return -1; }
@@ -82,29 +107,37 @@ int parse_url(char *filepath, char **hostname, char **port, char **path, int *ha
     *hostname = strndup(url, host_len); // copies host_len bytes of url into hostname
     url += host_len;
 
+    // ex: http://derp.derp.example.com:30/kek?derp=true
+
     // Parse port
     if (strncmp(url, ":", 1) == 0) {
         url++;
         size_t port_len = strcspn(url, "/");
         *port = strndup(url, port_len);
+        url += port_len;        
     } else {
         *port = "80";
     }
 
-    puts(url);
+    size_t path_len = strcspn(url, "?");
+    *path = strndup(url, path_len);
 
-
-
+    url += path_len;
+    size_t query_len = strlen(url);
+    if (query_len > 0) { *has_query = 1; } else { *has_query = 0; }
 
     return 1;
 }
+
+// fetch from origin
+// serve from cache
 
 void handle_client_request(char *buf) {
     char *filepath = validate_proxy_request(buf);
     
     if (filepath == NULL) {
         // set 400 BAD Request, send back to client
-        printf("ERORR: could not get filepath\n");
+        printf("ERORR: Could not get filepath\n");
         return;
     }
 
@@ -128,6 +161,35 @@ void handle_client_request(char *buf) {
     printf("Path: %s\n", path);
     printf("Has query params: %s\n", has_query ? "yes" : "no");
 
+    // Check if hostname resolves
+    struct hostent *host = gethostbyname(hostname);
+    if (host == NULL) {
+        printf("ERROR: Could not resolve host %s\n", hostname);
+        // TODO: Send 404 Not Found response to client
+        return;
+    }
+
+    printf("Host resolved successfully to IP\n");
+
+    char *cachepath = construct_cache_path(hostname, port, path);
+
+    printf("Cache path: %s\n", cachepath);
+
+    // TODO: if dynamic, dont cache
+    // else, cache
+
+    // if in cache and is not timed out, return cached
+    // not in cache, set it in a to_be_cached, and wait for it to be in cache, then send
+
+
+    // check if in cache
+    // create ./cache folder if does not exist
+    // derive path for content: ./cache/[host_port]/[path]
+
+    // i
+
+    // need to handle urls like example.com/ with no file specified, I think its safe to assume itll be index.html
+
     // http:// myhost.example.com :30/?derp=123
 
 
@@ -141,8 +203,6 @@ void handle_client_request(char *buf) {
     // char *request_body;
     // construct_request(request_body);
 }
-
-//
 
 
 
