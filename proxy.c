@@ -12,6 +12,8 @@
 #define BUFSIZE 32768
 #define MAX_CONNECTIONS 8
 
+static const char BAD_REQUEST[] = "400 Bad Request";
+
 // parse_proxy_request
 // determine if valid (parse incoming socket1)
 //      validate_proxy_request()
@@ -19,7 +21,10 @@
 //              if not valid, return 400 Bad Request
 //              if valid:
 //                  parse into 3 parts: host&port (default port 80 if none is specified), requested path, optional message body (query params)
-//                  if host does not resolve ip (using gethostbyname), return 404 Not Found
+//                  if host does not resolve ip (using gethostbyname (try getaddrinfo)), return 404 Not Found
+//                  if dynamic page (has ?), prob don't want to cache
+//                  if in cache and is not timed out, return cached
+//                  not in cache, set it in a to_be_cached, and wait for it to be in cache, then send
 // send http request to host
 //      create second socket (socket2) to send request to host server
 //      forward this result along socket1
@@ -27,8 +32,122 @@
 
 
 // cache process (in a seperate forked process)
+// need to store in ./cache folder
+
+void construct_request();
+
+int craft_response(char *buf, int http_version, const char *status) {
+    const char *version_str = (http_version == 0) ? "HTTP/1.0" : "HTTP/1.1";
+
+    bzero(buf, BUFSIZE);
+    return snprintf(buf, BUFSIZE,
+             "%s %s\r\n"
+             "Content-Length: 0\r\n"
+             "Connection: close\r\n"
+             "\r\n",
+             version_str, status);
+}
+
+/*
+    Validate's request, and if vaid, returns filepath, else NULL
+*/
+char* validate_proxy_request(char *buf) {
+    char *method = strtok(buf, " \r\n");
+    if (!method) { return NULL; }
+
+    // If not GET, fail out early
+    if (strcmp(method, "GET") != 0) { return NULL; }
+
+    char *filepath = strtok(NULL, " \r\n");
+    if (!filepath) { return NULL; }
+
+    char *http_version_header = strtok(NULL, " \r\n");
+    if (!http_version_header) { return NULL; }
+
+    return filepath;    
+}
+
+int parse_url(char *filepath, char **hostname, char **port, char **path, int *has_query) {
+    char *url = filepath;
+
+    printf("url: %s\n", url);
+
+    // Must be http
+    if (strncmp(url, "http://", 7) != 0) { printf("PARSE ERR: Not http\n"); return -1; }
+    url += 7;
+
+    // Parse hostname
+    size_t host_len = strcspn(url, ":/?"); // Length until port, path, or query
+    if (host_len == 0) {  printf("PARSE ERR: No :/?\n"); return - 1; }
+    *hostname = strndup(url, host_len); // copies host_len bytes of url into hostname
+    url += host_len;
+
+    // Parse port
+    if (strncmp(url, ":", 1) == 0) {
+        url++;
+        size_t port_len = strcspn(url, "/");
+        *port = strndup(url, port_len);
+    } else {
+        *port = "80";
+    }
+
+    puts(url);
 
 
+
+
+    return 1;
+}
+
+void handle_client_request(char *buf) {
+    char *filepath = validate_proxy_request(buf);
+    
+    if (filepath == NULL) {
+        // set 400 BAD Request, send back to client
+        printf("ERORR: could not get filepath\n");
+        return;
+    }
+
+    printf("filepath: %s\n", filepath);
+
+    char *hostname;
+    char *port;
+    char *path;
+    int has_query;
+
+    int parse_res = parse_url(filepath, &hostname, &port, &path, &has_query);
+
+    if (parse_res < 0) {
+        // set 400 BAD Request, send back to client
+        printf("ERROR: Failed to parse URL\n");
+        return;
+    }
+
+    printf("Hostname: %s\n", hostname);
+    printf("Port: %s\n", port);
+    printf("Path: %s\n", path);
+    printf("Has query params: %s\n", has_query ? "yes" : "no");
+
+    // http:// myhost.example.com :30/?derp=123
+
+
+    //
+
+    // get host, check if it resolves, 
+
+    // Parse into 3 parts, 
+    // host&port (default port 80 if none is specified), requested path, optional message body (query params)
+
+    // char *request_body;
+    // construct_request(request_body);
+}
+
+//
+
+
+
+
+// Creates proxy listening server
 int main (int argc, char **argv) {
     int portno, connfd, n, optval, listenfd;
     pid_t childpid;
@@ -88,7 +207,9 @@ int main (int argc, char **argv) {
             n = recv(connfd, buf, BUFSIZE, 0);
             if (n > 0) {
                 printf("String received from and resent to the client:\n");
-                puts(buf);
+                // puts(buf);
+
+                handle_client_request(buf);
 
                 // int response_len = parse_request(buf, connfd);
                 // printf("parsed buf %s\n", buf);
