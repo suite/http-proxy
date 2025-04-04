@@ -49,6 +49,24 @@ int craft_response(char *buf, int http_version, const char *status) {
              version_str, status);
 }
 
+char* get_content_type(char *filepath) {
+    char *ext = strrchr(filepath, '.');
+    if (!ext) return "application/octet-stream";
+    
+    if (strcmp(ext, ".html") == 0 
+        || strcmp(ext, ".htm") == 0) return "text/html";
+    if (strcmp(ext, ".txt") == 0)    return "text/plain";
+    if (strcmp(ext, ".png") == 0)    return "image/png";
+    if (strcmp(ext, ".gif") == 0)    return "image/gif";
+    if (strcmp(ext, ".jpg") == 0)    return "image/jpg";
+    if (strcmp(ext, ".ico") == 0)    return "image/x-icon";
+    if (strcmp(ext, ".css") == 0)    return "text/css";
+    if (strcmp(ext, ".js") == 0)     return "application/javascript";
+    
+    return "application/octet-stream";
+}
+
+
 /*
     Validate's request, and if vaid, returns filepath, else NULL
 */
@@ -132,7 +150,43 @@ int parse_url(char *filepath, char **hostname, char **port, char **path, int *ha
 // fetch from origin
 // serve from cache
 
-void handle_client_request(char *buf) {
+int serve_from_cache(int connfd, char *cache_path) {
+    FILE* cache_file = fopen(cache_path, "r");
+    if (cache_file == NULL)  { printf("SERVE CACHE ERR: File not found %s\n", cache_path); return -1; }
+
+    // Get file size
+    if (fseek(cache_file, 0, SEEK_END) != 0)  { fclose(cache_file); return -1; }
+    long file_size = ftell(cache_file);
+    if (file_size == -1)                      { fclose(cache_file); return -1; }
+    if (fseek(cache_file, 0, SEEK_SET) != 0)  { fclose(cache_file); return -1; }
+
+    // Construct headers
+    char *content_type = get_content_type(cache_path);
+    char buf[BUFSIZE];
+    int header_len = snprintf(buf, BUFSIZE,
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %ld\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        content_type, file_size);
+
+    // Send headers
+    send(connfd, buf, header_len, 0);
+
+    // Send file in chunks
+    long remaining = file_size;
+    while (remaining > 0) {
+        int to_read = (remaining < BUFSIZE) ? remaining : BUFSIZE;
+        int bytes_read = fread(buf, 1, to_read, cache_file); // Reuse buf
+        send(connfd, buf, bytes_read, 0);
+        remaining -= bytes_read;
+    }
+
+    fclose(cache_file);
+}
+
+void handle_client_request(int connfd, char *buf) {
     char *filepath = validate_proxy_request(buf);
     
     if (filepath == NULL) {
@@ -171,9 +225,21 @@ void handle_client_request(char *buf) {
 
     printf("Host resolved successfully to IP\n");
 
-    char *cachepath = construct_cache_path(hostname, port, path);
+    char *cache_path = construct_cache_path(hostname, port, path);
 
-    printf("Cache path: %s\n", cachepath);
+    printf("Cache path: %s\n", cache_path);
+
+    // working
+    int serve_res = serve_from_cache(connfd, cache_path);
+    if (parse_res < 0) {
+        // set 400 BAD Request, send back to client
+        printf("ERROR: Failed to serve cache\n");
+        return;
+    }
+
+
+
+    // serve from cache
 
     // TODO: if dynamic, dont cache
     // else, cache
@@ -269,7 +335,7 @@ int main (int argc, char **argv) {
                 printf("String received from and resent to the client:\n");
                 // puts(buf);
 
-                handle_client_request(buf);
+                handle_client_request(connfd, buf);
 
                 // int response_len = parse_request(buf, connfd);
                 // printf("parsed buf %s\n", buf);
