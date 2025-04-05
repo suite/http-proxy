@@ -9,12 +9,15 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <arpa/inet.h>
+#include <errno.h>
 
 #define BUFSIZE 32768
 #define MAX_CONNECTIONS 8
 
 static const char BAD_REQUEST[] = "400 Bad Request";
 
+// Rough outline:
 // parse_proxy_request
 // determine if valid (parse incoming socket1)
 //      validate_proxy_request()
@@ -30,15 +33,13 @@ static const char BAD_REQUEST[] = "400 Bad Request";
 //      create second socket (socket2) to send request to host server
 //      forward this result along socket1
 
-
-
 // cache process (in a seperate forked process)
 // need to store in ./cache folder
 
 void construct_request();
 
-int craft_response(char *buf, int http_version, const char *status) {
-    const char *version_str = (http_version == 0) ? "HTTP/1.0" : "HTTP/1.1";
+int craft_response(char *buf, int http_version, char *status) {
+    char *version_str = (http_version == 0) ? "HTTP/1.0" : "HTTP/1.1";
 
     bzero(buf, BUFSIZE);
     return snprintf(buf, BUFSIZE,
@@ -51,7 +52,7 @@ int craft_response(char *buf, int http_version, const char *status) {
 
 char* get_content_type(char *filepath) {
     char *ext = strrchr(filepath, '.');
-    if (!ext) return "application/octet-stream";
+    if (!ext) return "text/html";
     
     if (strcmp(ext, ".html") == 0 
         || strcmp(ext, ".htm") == 0) return "text/html";
@@ -66,10 +67,57 @@ char* get_content_type(char *filepath) {
     return "application/octet-stream";
 }
 
+// Util for creating directories recursively (like mkdir -p)
+int mkdir_p(char *path) {
+    char *p = strdup(path);  // Create a duplicate of path that we can modify
+    char *slash = p;
 
-/*
-    Validate's request, and if vaid, returns filepath, else NULL
-*/
+    // While another slash exists in the path
+    while ((slash = strchr(slash, '/')) != NULL) {
+        *slash = '\0';  // Temporarily terminate string at this slash
+        
+        // Try to create directory with rwxr-xr-x permissions
+        // Continue if directory exists, fail on other errors
+        if (strlen(p) > 0) {
+            printf("Attempting to create directory: %s\n", p);
+            if (mkdir(p, 0755) != 0) {
+                if (errno == EEXIST) {
+                    printf("Directory already exists: %s\n", p);
+                } else {
+                    printf("Failed to create directory %s: %s\n", p, strerror(errno));
+                    free(p);
+                    return -1;
+                }
+            } else {
+                printf("Successfully created directory: %s\n", p);
+            }
+        }
+        
+        *slash = '/';  // Restore the slash
+        slash++;       // Move to next character
+    }
+
+    // Create the final directory (the full path)
+    if (strlen(p) > 0) {
+        printf("Attempting to create final directory: %s\n", p);
+        if (mkdir(p, 0755) != 0) {
+            if (errno == EEXIST) {
+                printf("Final directory already exists: %s\n", p);
+            } else {
+                printf("Failed to create final directory %s: %s\n", p, strerror(errno));
+                free(p);
+                return -1;
+            }
+        } else {
+            printf("Successfully created final directory: %s\n", p);
+        }
+    }
+    free(p);
+    return 1;
+}
+
+
+// Validate's request, and if vaid, returns filepath, else NULL
 char* validate_proxy_request(char *buf) {
     char *method = strtok(buf, " \r\n");
     if (!method) { return NULL; }
@@ -86,7 +134,7 @@ char* validate_proxy_request(char *buf) {
     return filepath;    
 }
 
-
+// TODO: Maybe don't assume index.html, I think it's fine for file name (can be anything), but we're assuming content type..
 char* construct_cache_path(char* hostname, char* port, char* path) {
     char *cache_dir = "./cache";
     char *host_port = malloc(strlen(hostname) + strlen(port) + 2);
@@ -147,8 +195,66 @@ int parse_url(char *filepath, char **hostname, char **port, char **path, int *ha
     return 1;
 }
 
-// fetch from origin
-// serve from cache
+// ripped from https://beej.us/guide/bgnet/examples/client.c
+void *get_in_addr(struct sockaddr *sa) {
+    if (sa->sa_family == AF_INET) {
+        return &(((struct sockaddr_in*)sa)->sin_addr);
+    }
+    return &(((struct sockaddr_in6*)sa)->sin6_addr);
+}
+
+// adapted from https://beej.us/guide/bgnet/examples/client.c
+int connect_to_host(char *hostname, char *port) {
+    int sockfd;
+    struct addrinfo hints, *servinfo, *p;
+    int rv;
+    char s[INET6_ADDRSTRLEN];
+
+    // Initialize hints structure
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;    // Allow IPv4 or IPv6
+    hints.ai_socktype = SOCK_STREAM; // TCP stream sockets
+
+    // Resolve hostname and port to address info
+    if ((rv = getaddrinfo(hostname, port, &hints, &servinfo)) != 0) {
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
+        return -1;
+    }
+
+    // Loop through all results and connect to the first available
+    for (p = servinfo; p != NULL; p = p->ai_next) {
+        // Create socket
+        if ((sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) {
+            perror("client: socket");
+            continue;
+        }
+
+        // Attempt to connect
+        if (connect(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
+            perror("client: connect");
+            close(sockfd);
+            continue;
+        }
+
+        break; // Successfully connected
+    }
+
+    // Check if connection failed
+    if (p == NULL) {
+        fprintf(stderr, "client: failed to connect\n");
+        freeaddrinfo(servinfo);
+        return -1;
+    }
+
+    // Print the IP address we connected to
+    inet_ntop(p->ai_family, get_in_addr((struct sockaddr *)p->ai_addr), s, sizeof s);
+    printf("client: connecting to %s\n", s);
+
+    // Free address info structure
+    freeaddrinfo(servinfo);
+
+    return sockfd; // Return the connected socket file descriptor
+}
 
 int serve_from_cache(int connfd, char *cache_path) {
     FILE* cache_file = fopen(cache_path, "r");
@@ -184,6 +290,88 @@ int serve_from_cache(int connfd, char *cache_path) {
     }
 
     fclose(cache_file);
+}
+
+int fetch_from_origin(int connfd, char *hostname, char* port, char *path, FILE *cache_file) {
+    int origin_fd = connect_to_host(hostname, port);
+    if (origin_fd < 0) { printf("FETCH ORIGIN ERR: Could not connect to host %s\n", hostname); return -1; }
+
+    // Send GET request to host
+    char request[BUFSIZE];
+    snprintf(request, BUFSIZE, "GET %s HTTP/1.0\r\nHost: %s\r\n\r\n", path, hostname);
+    send(origin_fd, request, strlen(request), 0);
+
+    // Read in response from host
+    char buf[BUFSIZE];
+    int n = 0; // Number of bytes recieved in each recv
+    int total = 0; // Running total for each chunk
+    int headers_done = 0;
+    char *body_start = NULL;
+
+    // Receive data into buf, appending at buf + total up to BUFSIZE - total bytes
+    while ((n = recv(origin_fd, buf + total, BUFSIZE - total, 0)) > 0) {
+        total += n; // Might not need, really only needed for rare case headers are huge
+        if (!headers_done) {
+            body_start = strstr(buf, "\r\n\r\n");
+            if (body_start) {
+                headers_done = 1;
+                body_start += 4; // Move past \r\n\r\n
+
+                // Check if response is 200 OK
+                // TODO: dont check http version
+                if (strncmp(buf, "HTTP/1.0 200 OK", 15) != 0 && 
+                    strncmp(buf, "HTTP/1.1 200 OK", 15) != 0) {
+                    // Not 200 OK, send error to client and exit
+
+                    // TODO:
+
+                    //  char *error = "HTTP/1.0 502 Bad Gateway\r\n\r\n";
+                    // send(connfd, error, strlen(error), 0);
+
+                    printf("ETCH ORIGIN ERR: Origin server returned non-200 response:\n%.100s\n", buf);
+                    
+                    close(origin_fd);
+                    if (cache_file) fclose(cache_file);
+                    return -1;
+                }
+
+                // Headers end here, start processing body
+                int header_len = body_start - buf;
+                int body_len = total - header_len;
+
+                // Cache the body if we have a cache file
+                if (cache_file && body_len > 0) {
+                    fwrite(body_start, 1, body_len, cache_file);
+                }
+
+                // Construct our own headers
+                char *content_type = get_content_type(path);
+                char header[BUFSIZE];
+                int hlen = snprintf(header, BUFSIZE,
+                    "HTTP/1.0 200 OK\r\n"
+                    "Content-Type: %s\r\n"
+                    "Connection: close\r\n"
+                    "\r\n",
+                    content_type);
+
+                // Send headers followed by initial body chunk
+                send(connfd, header, hlen, 0);
+                if (body_len > 0) {
+                    send(connfd, body_start, body_len, 0);
+                }
+                total = 0; // Reset buffer
+            }
+        } else {
+            // Already in body, cache and send to client
+            if (cache_file) {
+                fwrite(buf, 1, total, cache_file);
+            }
+            send(connfd, buf, total, 0);
+            total = 0;
+        }
+    }
+
+    return 1;
 }
 
 void handle_client_request(int connfd, char *buf) {
@@ -230,13 +418,34 @@ void handle_client_request(int connfd, char *buf) {
     printf("Cache path: %s\n", cache_path);
 
     // working
-    int serve_res = serve_from_cache(connfd, cache_path);
-    if (parse_res < 0) {
-        // set 400 BAD Request, send back to client
-        printf("ERROR: Failed to serve cache\n");
-        return;
+    // if in cache do this
+    if (0) {
+        int serve_res = serve_from_cache(connfd, cache_path);
+        if (parse_res < 0) {
+            // set 400 BAD Request, send back to client
+            printf("ERROR: Failed to serve cache\n");
+            return;
+        }
     }
 
+    // if dynamic
+
+    // create dir struct if needed
+    char* dir_path = strdup(cache_path);
+    char* last_slash = strrchr(dir_path, '/');
+    if (last_slash) {
+        *last_slash = '\0';
+        int mkdir_res = mkdir_p(dir_path);
+        printf("mkdir result: %d\n", mkdir_res);
+    }
+    free(dir_path);
+
+    FILE* cache_file = fopen(cache_path, "wb");
+    int fetch_res = fetch_from_origin(connfd, hostname, port, path, cache_file);
+    printf("Fetch result: %d\n", fetch_res);
+
+    // int conn_res = connect_to_host(hostname, port);
+    // printf("Connection result: %d\n", conn_res);
 
 
     // serve from cache
