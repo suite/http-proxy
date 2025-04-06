@@ -11,11 +11,31 @@
 #include <signal.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <time.h>
+#include <fcntl.h>
 
 #define BUFSIZE 32768
 #define MAX_CONNECTIONS 8
 
 static const char BAD_REQUEST[] = "400 Bad Request";
+static const char NOT_FOUND[] = "404 Not Found";
+
+int timeout_seconds;      // Timeout arg
+static int listenfd = -1; // Global listening socket
+
+void handle_sigint(int sig) {
+    printf("\nReceived Ctrl+C. Handling graceful shutdown...\n");
+    
+    if (listenfd != -1) {
+        close(listenfd);
+    }
+
+    // Wait for any child processes to finish, WNOHANG so we don't block waitpid
+    while (waitpid(-1, NULL, WNOHANG) > 0);
+    
+    printf("Server shutdown complete.\n");
+    exit(0);
+}
 
 // Rough outline:
 // parse_proxy_request
@@ -36,37 +56,10 @@ static const char BAD_REQUEST[] = "400 Bad Request";
 // cache process (in a seperate forked process)
 // need to store in ./cache folder
 
-void construct_request();
 
-int craft_response(char *buf, int http_version, char *status) {
-    char *version_str = (http_version == 0) ? "HTTP/1.0" : "HTTP/1.1";
-
-    bzero(buf, BUFSIZE);
-    return snprintf(buf, BUFSIZE,
-             "%s %s\r\n"
-             "Content-Length: 0\r\n"
-             "Connection: close\r\n"
-             "\r\n",
-             version_str, status);
-}
-
-char* get_content_type(char *filepath) {
-    char *ext = strrchr(filepath, '.');
-    if (!ext) return "text/html";
-    
-    if (strcmp(ext, ".html") == 0 
-        || strcmp(ext, ".htm") == 0) return "text/html";
-    if (strcmp(ext, ".txt") == 0)    return "text/plain";
-    if (strcmp(ext, ".png") == 0)    return "image/png";
-    if (strcmp(ext, ".gif") == 0)    return "image/gif";
-    if (strcmp(ext, ".jpg") == 0)    return "image/jpg";
-    if (strcmp(ext, ".ico") == 0)    return "image/x-icon";
-    if (strcmp(ext, ".css") == 0)    return "text/css";
-    if (strcmp(ext, ".js") == 0)     return "application/javascript";
-    
-    return "application/octet-stream";
-}
-
+/*
+    FILE UTILS
+*/
 // Util for creating directories recursively (like mkdir -p)
 int mkdir_p(char *path) {
     char *p = strdup(path);  // Create a duplicate of path that we can modify
@@ -116,6 +109,53 @@ int mkdir_p(char *path) {
     return 1;
 }
 
+int file_exists(char *path) {
+    return access(path, F_OK) == 0;
+}
+
+int is_timed_out(char *path) {
+    struct stat sb;
+    if (stat(path, &sb) == -1) {
+        return 1; // Assume timed out if stat fails
+    }
+    time_t now;
+    time(&now);
+    double diff = difftime(now, sb.st_mtime); // sb.st_mtime last modifcation time
+    return diff > timeout_seconds;
+}
+
+/*
+    NETWORK UTILS
+*/
+// Sends a response with just a status code (no body)
+void send_status_response(int connfd, const char *status) {
+    char buf[BUFSIZE];
+    bzero(buf, BUFSIZE);
+    int len = snprintf(buf, BUFSIZE,
+             "HTTP/1.0 %s\r\n"
+             "Content-Length: 0\r\n"
+             "Connection: close\r\n"
+             "\r\n",
+             status);
+    send(connfd, buf, len, 0);
+}
+
+char* get_content_type(char *filepath) {
+    char *ext = strrchr(filepath, '.');
+    if (!ext) return "text/html";
+    
+    if (strcmp(ext, ".html") == 0 
+        || strcmp(ext, ".htm") == 0) return "text/html";
+    if (strcmp(ext, ".txt") == 0)    return "text/plain";
+    if (strcmp(ext, ".png") == 0)    return "image/png";
+    if (strcmp(ext, ".gif") == 0)    return "image/gif";
+    if (strcmp(ext, ".jpg") == 0)    return "image/jpg";
+    if (strcmp(ext, ".ico") == 0)    return "image/x-icon";
+    if (strcmp(ext, ".css") == 0)    return "text/css";
+    if (strcmp(ext, ".js") == 0)     return "application/javascript";
+    
+    return "application/octet-stream";
+}
 
 // Validate's request, and if vaid, returns filepath, else NULL
 char* validate_proxy_request(char *buf) {
@@ -257,7 +297,7 @@ int connect_to_host(char *hostname, char *port) {
 }
 
 int serve_from_cache(int connfd, char *cache_path) {
-    FILE* cache_file = fopen(cache_path, "r");
+    FILE *cache_file = fopen(cache_path, "r");
     if (cache_file == NULL)  { printf("SERVE CACHE ERR: File not found %s\n", cache_path); return -1; }
 
     // Get file size
@@ -294,7 +334,11 @@ int serve_from_cache(int connfd, char *cache_path) {
 
 int fetch_from_origin(int connfd, char *hostname, char* port, char *path, FILE *cache_file) {
     int origin_fd = connect_to_host(hostname, port);
-    if (origin_fd < 0) { printf("FETCH ORIGIN ERR: Could not connect to host %s\n", hostname); return -1; }
+    if (origin_fd < 0) { 
+        printf("FETCH ORIGIN ERR: Could not connect to host %s\n", hostname); 
+        send_status_response(connfd, BAD_REQUEST);
+        return -1;
+    }
 
     // Send GET request to host
     char request[BUFSIZE];
@@ -318,18 +362,10 @@ int fetch_from_origin(int connfd, char *hostname, char* port, char *path, FILE *
                 body_start += 4; // Move past \r\n\r\n
 
                 // Check if response is 200 OK
-                // TODO: dont check http version
                 if (strncmp(buf, "HTTP/1.0 200 OK", 15) != 0 && 
                     strncmp(buf, "HTTP/1.1 200 OK", 15) != 0) {
-                    // Not 200 OK, send error to client and exit
-
-                    // TODO:
-
-                    //  char *error = "HTTP/1.0 502 Bad Gateway\r\n\r\n";
-                    // send(connfd, error, strlen(error), 0);
-
-                    printf("ETCH ORIGIN ERR: Origin server returned non-200 response:\n%.100s\n", buf);
-                    
+                    printf("FETCH ORIGIN ERR: Origin server returned non-200 response:\n%.100s\n", buf);
+                    send_status_response(connfd, BAD_REQUEST);
                     close(origin_fd);
                     if (cache_file) fclose(cache_file);
                     return -1;
@@ -378,8 +414,8 @@ void handle_client_request(int connfd, char *buf) {
     char *filepath = validate_proxy_request(buf);
     
     if (filepath == NULL) {
-        // set 400 BAD Request, send back to client
-        printf("ERORR: Could not get filepath\n");
+        printf("ERROR: Could not get filepath\n");
+        send_status_response(connfd, BAD_REQUEST);
         return;
     }
 
@@ -393,8 +429,8 @@ void handle_client_request(int connfd, char *buf) {
     int parse_res = parse_url(filepath, &hostname, &port, &path, &has_query);
 
     if (parse_res < 0) {
-        // set 400 BAD Request, send back to client
         printf("ERROR: Failed to parse URL\n");
+        send_status_response(connfd, BAD_REQUEST);
         return;
     }
 
@@ -407,98 +443,102 @@ void handle_client_request(int connfd, char *buf) {
     struct hostent *host = gethostbyname(hostname);
     if (host == NULL) {
         printf("ERROR: Could not resolve host %s\n", hostname);
-        // TODO: Send 404 Not Found response to client
+        send_status_response(connfd, NOT_FOUND);
         return;
     }
 
     printf("Host resolved successfully to IP\n");
 
-    char *cache_path = construct_cache_path(hostname, port, path);
+    if (has_query) { // if dynamic
+        printf("Dynamic URL, fetching from origin\n");
+        fetch_from_origin(connfd, hostname, port, path, NULL);
+    } else {
+        char *cache_path = construct_cache_path(hostname, port, path);
 
-    printf("Cache path: %s\n", cache_path);
+        printf("Cache path: %s\n", cache_path);
 
-    // working
-    // if in cache do this
-    if (0) {
-        int serve_res = serve_from_cache(connfd, cache_path);
-        if (parse_res < 0) {
-            // set 400 BAD Request, send back to client
-            printf("ERROR: Failed to serve cache\n");
-            return;
+        if (file_exists(cache_path) && !is_timed_out(cache_path)) {
+            printf("Valid cache, serving from cache: %s\n", cache_path);
+            serve_from_cache(connfd, cache_path); // TODO: err check? this goes for all serve's and fetches
+        } else {
+             // create dir struct if needed
+            char *dir_path = strdup(cache_path);
+            char *last_slash = strrchr(dir_path, '/');
+            if (last_slash) {
+                *last_slash = '\0';
+                mkdir_p(dir_path);
+            }
+            free(dir_path);
+
+            // Not in cache, need only this child process to fetch from origin, other's wait
+            char *fetching_path = malloc(strlen(cache_path) + 10);
+            sprintf(fetching_path, "%s.fetching", cache_path);
+
+            // Create lock file with O_EXCL flag which fails if file already exists
+            // 0644 permissions = Owner can read/write, group and others can only read
+            int fd = open(fetching_path, O_CREAT | O_EXCL, 0644);
+
+            if (fd != -1) {
+                // Successfully created lock file - this process will handle the fetch
+                close(fd);  // Close the file descriptor, we just need the file to exist
+
+                FILE *cache_file = fopen(cache_path, "wb");
+                if (cache_file) {
+                    printf("Fetching and caching: %s\n", cache_path);
+                    fetch_from_origin(connfd, hostname, port, path, cache_file);
+                } else {
+                    printf("Failed to open cache file, treating as dynamic URL\n");
+                    fetch_from_origin(connfd, hostname, port, path, NULL);
+                }
+
+                unlink(fetching_path);  // Remove lock file when done
+            } else {
+                // Another process is fetching, wait
+                printf("Waiting for cache: %s\n", cache_path);
+
+                // while locked.. sleep
+                while (file_exists(fetching_path)) {
+                    usleep(100000); // 0.1 seconds
+                }
+
+                if (file_exists(cache_path)) {
+                    printf("Serving from cache after wait: %s\n", cache_path);
+                    serve_from_cache(connfd, cache_path);
+                } else {
+                    printf("Failed to open cache file, treating as dynamic URL\n");
+                    fetch_from_origin(connfd, hostname, port, path, NULL);
+                }
+            }
+            free(fetching_path);
         }
+        free(cache_path);
     }
-
-    // if dynamic
-
-    // create dir struct if needed
-    char* dir_path = strdup(cache_path);
-    char* last_slash = strrchr(dir_path, '/');
-    if (last_slash) {
-        *last_slash = '\0';
-        int mkdir_res = mkdir_p(dir_path);
-        printf("mkdir result: %d\n", mkdir_res);
-    }
-    free(dir_path);
-
-    FILE* cache_file = fopen(cache_path, "wb");
-    int fetch_res = fetch_from_origin(connfd, hostname, port, path, cache_file);
-    printf("Fetch result: %d\n", fetch_res);
-
-    // int conn_res = connect_to_host(hostname, port);
-    // printf("Connection result: %d\n", conn_res);
-
-
-    // serve from cache
-
-    // TODO: if dynamic, dont cache
-    // else, cache
-
-    // if in cache and is not timed out, return cached
-    // not in cache, set it in a to_be_cached, and wait for it to be in cache, then send
-
-
-    // check if in cache
-    // create ./cache folder if does not exist
-    // derive path for content: ./cache/[host_port]/[path]
-
-    // i
-
-    // need to handle urls like example.com/ with no file specified, I think its safe to assume itll be index.html
-
-    // http:// myhost.example.com :30/?derp=123
-
-
-    //
-
-    // get host, check if it resolves, 
-
-    // Parse into 3 parts, 
-    // host&port (default port 80 if none is specified), requested path, optional message body (query params)
-
-    // char *request_body;
-    // construct_request(request_body);
 }
 
 
 
+/*
+  Creates proxy listening server
+  Inspired by https://www.cs.dartmouth.edu/~campbell/cs50/socketprogramming.html
+*/
 
-// Creates proxy listening server
 int main (int argc, char **argv) {
-    int portno, connfd, n, optval, listenfd;
+    int portno, connfd, n, optval;
     pid_t childpid;
     socklen_t clilen;
     char buf[BUFSIZE];
     struct sockaddr_in cliaddr, servaddr;
 
-    // TODO: Set up signal handler
+    // Set up signal handler
+    signal(SIGINT, handle_sigint);
 
     if (argc != 3) {
        fprintf(stderr,"usage: %s <port> <timeout>\n", argv[0]);
        exit(0);
     }
 
-    // Read in port
-    portno = atoi(argv[1]);
+    portno = atoi(argv[1]);             // Read in port
+    timeout_seconds = atoi(argv[2]);    // Read in timeout, store as global
 
     // Create a socket for the soclet
     // If sockfd<0 there was an error in the creation of the socket
@@ -541,19 +581,7 @@ int main (int argc, char **argv) {
 
             n = recv(connfd, buf, BUFSIZE, 0);
             if (n > 0) {
-                printf("String received from and resent to the client:\n");
-                // puts(buf);
-
                 handle_client_request(connfd, buf);
-
-                // int response_len = parse_request(buf, connfd);
-                // printf("parsed buf %s\n", buf);
-
-                // If error response (!= -1), send it
-                // -1 means we got a file to send, and we're chunking it out and sending elsewhere
-                // if (response_len != -1) {
-                //     send(connfd, buf, response_len, 0);
-                // }
             }
 
             if (n < 0)
